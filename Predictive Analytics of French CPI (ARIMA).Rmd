@@ -1,0 +1,244 @@
+---
+title: "Predictive Analytics of French CPI (ARIMA)"
+output:
+  pdf_document: default
+  html_document: default
+  word_document: default
+---
+# Import Package
+```{r}
+library(tidyverse)
+library(lubridate)
+library(tsibble)
+library(forecast)
+library(tseries)
+library(rstudioapi)
+library(ggplot2)
+library(slider)
+library(dplyr)
+library(feasts)
+library(gridExtra)
+library(urca)
+library(fable)
+# Load the data
+fcpi <- read.csv("fcpi.csv",sep = ';')
+head(fcpi)
+# Convert date format
+fcpi$time <- as.Date(fcpi$time, format="%Y-%m-%d")
+# Convert to yearmonth for tsibble format
+fcpi_tsibble <- fcpi %>%
+  mutate(time = yearmonth(time)) %>%
+  as_tsibble(index = time)
+glimpse(fcpi_tsibble)
+```
+# 1. Plot the data and the autocorrelation function. 
+```{r}
+# Plot the time series
+autoplot(fcpi_tsibble)+
+  ggtitle('French CPI(1960-2019)')+
+  xlab("Time") + ylab("CPI")
+# Plot rolling standard deviation
+fcpi_tsibble <- fcpi_tsibble %>%
+  mutate(rolling_sd = slide_dbl(cpi, sd, .before = 11, .complete = TRUE))
+
+ggplot(fcpi_tsibble, aes(x = time, y = rolling_sd)) +
+  geom_line(color = "blue") +
+  labs(title = "Rolling Standard Deviation (12 months)", x = "Time", y = "Standard Deviation") +
+  theme_minimal()
+```
+# 2. Based on the above plot, the variance of the series appears to be heteroscedastic, suggesting that a log transformation is necessary to stabilize the variance.
+```{r}
+# Logarithm
+fcpi_tsibble <- fcpi_tsibble %>%
+  mutate(fcpi_log=log(cpi))
+# Plot the log time series
+autoplot(fcpi_tsibble,fcpi_log)+
+  ggtitle('Log-transformed French CPI')+
+  xlab('Time')+ylab('Log(CPI)')
+```
+# 3. This series exibits a clear upward trend and is non-stationary, indicating the need for differencing (first differencing).
+
+```{r fig.width=14, fig.height=5}
+# First-Differencing
+fcpi_tsibble <- fcpi_tsibble %>%
+  mutate(fcpi_log_diff = difference(fcpi_log, differences = 1))
+
+# Plot differenced time series
+autoplot(fcpi_tsibble, fcpi_log_diff) +
+  ggtitle("Differenced Log CPI (First Difference)") +
+  xlab("Time") + ylab("Differenced log(CPI)")
+
+# Plot ACF and PACF
+acf_diff_plot <- ggAcf(fcpi_tsibble$fcpi_log_diff) +
+  ggtitle("ACF of Differenced Log CPI") 
+
+pacf_diff_plot <- ggPacf(fcpi_tsibble$fcpi_log_diff) +
+  ggtitle("PACF of Differenced Log CPI")
+
+grid.arrange(acf_diff_plot, pacf_diff_plot, ncol = 2)
+```
+# 4. As observed in the ACF plot, the series exhibits strong seasonality, as evidenced by significant correlations at the 12-lag and 24-lag intervals. Therefore, seasonal differencing will be applied to address this seasonality.
+```{r fig.width=14, fig.height=5}
+# Seasonal differencing
+fcpi_tsibble <- fcpi_tsibble %>%
+  mutate(fcpi_log_seasonal_diff = c(rep(NA,12),diff(fcpi_log_diff, lag = 12)))
+# Plot the seasonally differenced time series
+autoplot(fcpi_tsibble, fcpi_log_seasonal_diff) +
+  ggtitle("Differenced Log CPI (First Difference + Seasonal Difference)") +
+  xlab("Time") + ylab("Differenced log(CPI)")
+# Plot ACF and PACF
+acf_seasonal_diff_plot <- ggAcf(fcpi_tsibble$fcpi_log_seasonal_diff) +
+  ggtitle("ACF of Differenced Log CPI(First Difference + Seasonal Difference)") 
+
+pacf_seasonal_diff_plot <- ggPacf(fcpi_tsibble$fcpi_log_seasonal_diff) +
+  ggtitle("PACF of Differenced Log CPI(First Difference + Seasonal Difference)")
+
+grid.arrange(acf_seasonal_diff_plot, pacf_seasonal_diff_plot, ncol = 2)
+```
+# 5. Now we apply ADF test and KPSS test to assess the stationary of the processed time series.
+```{r}
+adf_test <- ur.df(na.omit(fcpi_tsibble$fcpi_log_seasonal_diff), type = "drift", selectlags = "AIC")
+summary(adf_test)
+```
+# ADF:
+The ADF test checks if a time series is stationary. The null hypothesis is that the series has a unit root (non-stationary), and the alternative is that it is stationary.
+
+Key Results:
+Test Statistic: -14.5889, which is much smaller than the critical value at the 1% level (-3.43), so we reject the null hypothesis.
+
+p-value: Very small (well below 0.05), confirming the rejection of the null hypothesis.
+
+Conclusion:
+Since both the test statistic and p-value suggest rejecting the null hypothesis, we conclude that the series is stationary.
+```{r}
+kpss_test <- kpss.test(na.omit(fcpi_tsibble$fcpi_log_seasonal_diff), null = "Level")
+kpss_test
+```
+# KPSS:
+The KPSS test checks for stationarity around a level. The null hypothesis is that the series is stationary, and the alternative is that it is non-stationary.
+
+Test Results:
+KPSS statistic: 0.12678
+
+p-value: 0.1
+
+At the 5% significance level, we fail to reject the null hypothesis.
+
+Conclusion:
+The series is stationary.
+
+# 6. Next, fit SARIMA models. The PACF plot shows a clear cutoff after lag 3 in the non-seasonal component, suggesting a potential value of p = 3. In the seasonal component, significant spikes are observed at lags 12 and 24, indicating that P = 2 may be appropriate. The ACF plot exhibits a gradual decay in the non-seasonal part, and thus is not used for identifying q. However, a prominent spike at lag 12 in the seasonal ACF suggests that Q = 1 could be a suitable choice. Consequently, this initial analysis suggests that a possible model for these data is an SARIMA(3,1,0)(2,1,1)[12]. I fit this model, along with some variations on it, and compute the AIC, BIC and AICc values.
+
+```{r}
+# Fit several SARIMA models
+
+model_result <- fcpi_tsibble %>%
+  model(
+    sarima_310_211 = ARIMA(fcpi_log ~ pdq(3,1,0) + PDQ(2,1,1,period=12)+0),
+    sarima_311_211 = ARIMA(fcpi_log ~ pdq(3,1,1) + PDQ(2,1,1,period=12)+0),
+    sarima_312_211 = ARIMA(fcpi_log ~ pdq(3,1,2) + PDQ(2,1,1,period=12)+0),
+    sarima_310_111 = ARIMA(fcpi_log ~ pdq(3,1,0) + PDQ(1,1,1,period=12)+0),
+    sarima_311_111 = ARIMA(fcpi_log ~ pdq(3,1,1) + PDQ(1,1,1,period=12)+0),
+    sarima_312_111 = ARIMA(fcpi_log ~ pdq(3,1,2) + PDQ(1,1,1,period=12)+0),
+    sarima_310_011 = ARIMA(fcpi_log ~ pdq(3,1,0) + PDQ(0,1,1,period=12)+0),
+    sarima_311_011 = ARIMA(fcpi_log ~ pdq(3,1,1) + PDQ(0,1,1,period=12)+0),
+    sarima_312_011 = ARIMA(fcpi_log ~ pdq(3,1,2) + PDQ(0,1,1,period=12)+0),
+    sarima_210_211 = ARIMA(fcpi_log ~ pdq(2,1,0) + PDQ(2,1,1,period=12)+0),
+    sarima_211_211 = ARIMA(fcpi_log ~ pdq(2,1,1) + PDQ(2,1,1,period=12)+0),
+    sarima_212_211 = ARIMA(fcpi_log ~ pdq(2,1,2) + PDQ(2,1,1,period=12)+0),
+    sarima_210_111 = ARIMA(fcpi_log ~ pdq(2,1,0) + PDQ(1,1,1,period=12)+0),
+    sarima_211_111 = ARIMA(fcpi_log ~ pdq(2,1,1) + PDQ(1,1,1,period=12)+0),
+    sarima_212_111 = ARIMA(fcpi_log ~ pdq(2,1,2) + PDQ(1,1,1,period=12)+0),
+    sarima_210_011 = ARIMA(fcpi_log ~ pdq(2,1,0) + PDQ(0,1,1,period=12)+0),
+    sarima_211_011 = ARIMA(fcpi_log ~ pdq(2,1,1) + PDQ(0,1,1,period=12)+0),
+    sarima_212_011 = ARIMA(fcpi_log ~ pdq(2,1,2) + PDQ(0,1,1,period=12)+0),
+  )
+
+# Compare the models
+glance(model_result)
+```
+# 7. Among all the candidate models, the SARIMA(2,1,1)(0,1,1)[12] model exhibited the lowest values for AIC, BIC, and AICc, indicating superior model performance. Consequently, it was chosen as the optimal model. The following is the model diagnostics for SARIMA(2,1,1)(0,1,1)[12].
+
+```{r fig.width=14, fig.height=8}
+
+# Select the best model from the list
+best_sarima_model <- model_result %>% select(sarima_211_011)
+
+# Generate residual diagnostic plots
+gg_tsresiduals(best_sarima_model)
+
+
+```
+Based on residual diagnostic:
+
+-   The residuals fluctuate randomly around zero, this means there is no trend or pattern left in the residuals.
+-   The ACF plot shows all autocorrelations are inside the confidence bands, this suggests there is no significant autocorrelation in the residuals.
+-   The histogram of the residuals looks like a normal distribution, this indicates the residuals are approximately normally distributed.
+-   There is no sign of seasonality or structure in the residual plot,  this means the model has captured the seasonal and trend components well.
+
+Conclusion: The residuals behave like white noise. This confirms that SARIMA(2,1,1)(0,1,1)[12] is a good model and fits the CPI data well.
+
+# 8. Ljung Box Test.
+
+```{r}
+augment(best_sarima_model) %>%
+  features(.innov, ljung_box)
+```
+# 9. Since the p-value is greater than 0.05, we fail to reject the null hypothesis. This means that the residuals from the SARIMA(2,1,1)(0,1,1)[12] model do not exhibit significant autocorrelation. In the end, the following plots show the 36-month forecast generated by the selected SARIMA model, with one plot representing the logged data and the other showing the original data.
+```{r fig.width=10, fig.height=6 }
+
+# Generate 36-month forecast
+sarima_forecast <- best_sarima_model %>%
+  forecast(h = "36 months")
+
+# Convert forecast to tibble
+forecast_tbl <- sarima_forecast %>% as_tibble()
+
+# Extract forecast interval (80% & 95%)
+forecast_interval <- sarima_forecast %>%
+  hilo(level = c(80, 95)) %>%
+  unpack_hilo(`80%`, names_sep = "_") %>%
+  unpack_hilo(`95%`, names_sep = "_")
+
+# Plot forecast with uncertainty intervals
+autoplot(sarima_forecast, fcpi_tsibble) +
+  ggtitle("Forecast from SARIMA(2,1,1)(0,1,1)[12] Model") +
+  xlab("Year") + ylab("Log CPI Forecast") +
+  theme_light()
+
+# Convert log CPI forecast to original CPI scale
+forecast_full_original <- forecast_interval %>%
+  mutate(
+    mean_original = exp(.mean),
+    lower_80_original = exp(`80%_lower`),
+    upper_80_original = exp(`80%_upper`),
+    lower_95_original = exp(`95%_lower`),
+    upper_95_original = exp(`95%_upper`)
+  )
+
+forecast_full_original
+
+# Plot forecast in Original Data
+ggplot() +
+  # 95% prediction interval
+  geom_ribbon(data = forecast_full_original,
+              aes(x = time, ymin = lower_95_original, ymax = upper_95_original),
+              fill = "lightblue", alpha = 0.5) +
+  # 80% prediction interval
+  geom_ribbon(data = forecast_full_original,
+              aes(x = time, ymin = lower_80_original, ymax = upper_80_original),
+              fill = "blue", alpha = 0.5) +
+  # Forecast mean (original CPI)
+  geom_line(data = forecast_full_original,
+            aes(x = time, y = mean_original), color = "blue") +
+  # Historical data (original CPI)
+  geom_line(data = fcpi_tsibble,
+            aes(x = time, y = cpi), color = "black") +
+  labs(
+    title = "Forecast from SARIMA Model (Original CPI Scale)",
+    x = "Year",
+    y = "CPI"
+  ) +
+  theme_light()
+
+```
